@@ -1,134 +1,153 @@
 #include "PlayMode.hpp"
 
-#include "LitColorTextureProgram.hpp"
-
-#include "DrawLines.hpp"
-#include "Mesh.hpp"
+#include "PixelFont.hpp"
 #include "Load.hpp"
 #include "gl_errors.hpp"
 #include "data_path.hpp"
 
 #include <glm/gtc/type_ptr.hpp>
+#include <glm/gtc/quaternion.hpp>
 
-#include <random>
+#include <array>
 
-GLuint hexapod_meshes_for_lit_color_texture_program = 0;
-Load< MeshBuffer > hexapod_meshes(LoadTagDefault, []() -> MeshBuffer const * {
-	MeshBuffer const *ret = new MeshBuffer(data_path("hexapod.pnct"));
-	hexapod_meshes_for_lit_color_texture_program = ret->make_vao_for_program(lit_color_texture_program->program);
-	return ret;
+//----- audio (CC0, from Kenney's "Impact Sounds" pack -- see README-impact-sounds.txt;
+// swap these for self-recorded sounds later if you want) -----
+
+// "footstep" plays on every successful step:
+Load< Sound::Sample > footstep_sample(LoadTagDefault, []() -> Sound::Sample const * {
+	return new Sound::Sample(data_path("footstep_concrete.wav"));
+});
+// "bump" plays when a step is blocked by a wall:
+Load< Sound::Sample > bump_sample(LoadTagDefault, []() -> Sound::Sample const * {
+	return new Sound::Sample(data_path("bump_soft.wav"));
+});
+// "beacon" is the exit's looping sound -- distinct timbre (a ringing bell) so it
+// doesn't get confused with footsteps/bumps:
+Load< Sound::Sample > beacon_sample(LoadTagDefault, []() -> Sound::Sample const * {
+	return new Sound::Sample(data_path("beacon_bell.wav"));
+});
+// "turn" plays whenever the player rotates 90 degrees:
+Load< Sound::Sample > turn_sample(LoadTagDefault, []() -> Sound::Sample const * {
+	return new Sound::Sample(data_path("turn_cloth.wav"));
 });
 
-Load< Scene > hexapod_scene(LoadTagDefault, []() -> Scene const * {
-	return new Scene(data_path("hexapod.scene"), [&](Scene &scene, Scene::Transform *transform, std::string const &mesh_name){
-		Mesh const &mesh = hexapod_meshes->lookup(mesh_name);
+//----- maze layout (fixed, hand-picked so the start's right side is a wall and its
+// south side is open -- see the ASCII art below) -----
+//
+// generated once by a randomized depth-first "backtracker" (seed 3) and then
+// hardcoded here: a procedural generator re-run at build time isn't reproducible
+// across compilers/platforms (std::shuffle's exact output isn't standardized to
+// match bit-for-bit between standard library implementations), so baking in the
+// result is what actually guarantees the same maze every time.
+static char const * const MazeRows[PlayMode::GridTall] = {
+	"#############",
+	"#S#.....#...#",
+	"#.###.#.###.#",
+	"#.....#...#.#",
+	"#########.#.#",
+	"#.......#...#",
+	"#.#####.###.#",
+	"#.#.......#.#",
+	"#.#########.#",
+	"#.#.......#.#",
+	"#.#.#####.#.#",
+	"#.......#..E#",
+	"#############",
+};
 
-		scene.drawables.emplace_back(transform);
-		Scene::Drawable &drawable = scene.drawables.back();
+static std::vector< bool > generate_maze() {
+	constexpr int32_t GridWide = PlayMode::GridWide;
+	constexpr int32_t GridTall = PlayMode::GridTall;
 
-		drawable.pipeline = lit_color_texture_program_pipeline;
-
-		drawable.pipeline.vao = hexapod_meshes_for_lit_color_texture_program;
-		drawable.pipeline.type = mesh.type;
-		drawable.pipeline.start = mesh.start;
-		drawable.pipeline.count = mesh.count;
-
-	});
-});
-
-Load< Sound::Sample > dusty_floor_sample(LoadTagDefault, []() -> Sound::Sample const * {
-	return new Sound::Sample(data_path("dusty-floor.opus"));
-});
-
-
-Load< Sound::Sample > honk_sample(LoadTagDefault, []() -> Sound::Sample const * {
-	return new Sound::Sample(data_path("honk.wav"));
-});
-
-
-PlayMode::PlayMode() : scene(*hexapod_scene) {
-	//get pointers to leg for convenience:
-	for (auto &transform : scene.transforms) {
-		if (transform.name == "Hip.FL") hip = &transform;
-		else if (transform.name == "UpperLeg.FL") upper_leg = &transform;
-		else if (transform.name == "LowerLeg.FL") lower_leg = &transform;
+	std::vector< bool > solid(GridWide * GridTall, true);
+	for (int32_t row = 0; row < GridTall; ++row) {
+		for (int32_t col = 0; col < GridWide; ++col) {
+			solid[row * GridWide + col] = (MazeRows[row][col] == '#');
+		}
 	}
-	if (hip == nullptr) throw std::runtime_error("Hip not found.");
-	if (upper_leg == nullptr) throw std::runtime_error("Upper leg not found.");
-	if (lower_leg == nullptr) throw std::runtime_error("Lower leg not found.");
+	return solid;
+}
 
-	hip_base_rotation = hip->rotation;
-	upper_leg_base_rotation = upper_leg->rotation;
-	lower_leg_base_rotation = lower_leg->rotation;
+//----- coordinate helpers -----
 
-	//get pointer to camera for convenience:
-	if (scene.cameras.size() != 1) throw std::runtime_error("Expecting scene to have exactly one camera, but it has " + std::to_string(scene.cameras.size()));
-	camera = &scene.cameras.front();
+static inline glm::vec3 grid_to_world(int32_t row, int32_t col, float y) {
+	return glm::vec3(col * PlayMode::CellSize, y, row * PlayMode::CellSize);
+}
 
-	//start music loop playing:
-	// (note: position will be over-ridden in update())
-	leg_tip_loop = Sound::loop_3D(*dusty_floor_sample, 1.0f, get_leg_tip_position(), 10.0f);
+bool PlayMode::is_solid(int32_t row, int32_t col) const {
+	if (row < 0 || row >= GridTall || col < 0 || col >= GridWide) return true; //treat out-of-bounds as walls
+	return maze_solid[row * GridWide + col];
+}
+
+//----- facing -----
+
+//player_cell is (col, row); these are the (dcol, drow) steps for each facing:
+// 0 = north, 1 = east, 2 = south, 3 = west (matches a -90-degree-per-step yaw below)
+static std::array< glm::ivec2, 4 > const FacingDelta = {{
+	glm::ivec2( 0,-1), //north
+	glm::ivec2( 1, 0), //east
+	glm::ivec2( 0, 1), //south
+	glm::ivec2(-1, 0), //west
+}};
+
+void PlayMode::update_camera_transform() {
+	camera->transform->position = grid_to_world(player_cell.y, player_cell.x, EyeHeight);
+	camera->transform->rotation = glm::angleAxis(glm::radians(-90.0f * float(facing)), glm::vec3(0.0f, 1.0f, 0.0f));
+}
+
+//----- stepping -----
+
+void PlayMode::try_step(glm::ivec2 const &delta) {
+	glm::ivec2 target = player_cell + delta;
+	if (is_solid(target.y, target.x)) {
+		Sound::play(*bump_sample, 0.6f);
+	} else {
+		player_cell = target;
+		Sound::play(*footstep_sample, 0.5f);
+	}
+}
+
+//----- PlayMode -----
+
+PlayMode::PlayMode() {
+	maze_solid = generate_maze();
+
+	start_cell = glm::ivec2(1, 1);
+	exit_cell = glm::ivec2(GridWide - 2, GridTall - 2);
+	player_cell = start_cell;
+	facing = 1; //face east, into the maze
+
+	//set up a bare camera (no transform hierarchy / meshes needed -- the screen stays black):
+	Scene::Transform *camera_transform = &scene.transforms.emplace_back();
+	scene.cameras.emplace_back(camera_transform);
+	camera = &scene.cameras.back();
+	camera->fovy = glm::radians(60.0f);
+	camera->near = 0.01f;
+	update_camera_transform();
+
+	//exit beacon: quiet, long-range loop that gets louder as you approach:
+	exit_beacon_loop = Sound::loop_3D(*beacon_sample, 0.4f, grid_to_world(exit_cell.y, exit_cell.x, EyeHeight), 6.0f);
 }
 
 PlayMode::~PlayMode() {
 }
 
 bool PlayMode::handle_event(SDL_Event const &evt, glm::uvec2 const &window_size) {
-
 	if (evt.type == SDL_EVENT_KEY_DOWN) {
-		if (evt.key.key == SDLK_ESCAPE) {
-			SDL_SetWindowRelativeMouseMode(Mode::window, false);
-			return true;
-		} else if (evt.key.key == SDLK_A) {
-			left.downs += 1;
-			left.pressed = true;
-			return true;
-		} else if (evt.key.key == SDLK_D) {
-			right.downs += 1;
-			right.pressed = true;
-			return true;
-		} else if (evt.key.key == SDLK_W) {
-			up.downs += 1;
-			up.pressed = true;
-			return true;
-		} else if (evt.key.key == SDLK_S) {
-			down.downs += 1;
-			down.pressed = true;
-			return true;
-		} else if (evt.key.key == SDLK_SPACE) {
-			if (honk_oneshot) honk_oneshot->stop();
-			honk_oneshot = Sound::play_3D(*honk_sample, 0.3f, glm::vec3(4.6f, -7.8f, 6.9f)); //hardcoded position of front of car, from blender
-		}
-	} else if (evt.type == SDL_EVENT_KEY_UP) {
 		if (evt.key.key == SDLK_A) {
-			left.pressed = false;
+			turn_left.downs += 1;
 			return true;
 		} else if (evt.key.key == SDLK_D) {
-			right.pressed = false;
+			turn_right.downs += 1;
 			return true;
 		} else if (evt.key.key == SDLK_W) {
-			up.pressed = false;
+			move_forward.downs += 1;
 			return true;
 		} else if (evt.key.key == SDLK_S) {
-			down.pressed = false;
+			move_back.downs += 1;
 			return true;
-		}
-	} else if (evt.type == SDL_EVENT_MOUSE_BUTTON_DOWN) {
-		if (SDL_GetWindowRelativeMouseMode(Mode::window) == false) {
-			SDL_SetWindowRelativeMouseMode(Mode::window, true);
-			return true;
-		}
-	} else if (evt.type == SDL_EVENT_MOUSE_MOTION) {
-		if (SDL_GetWindowRelativeMouseMode(Mode::window) == true) {
-			glm::vec2 motion = glm::vec2(
-				evt.motion.xrel / float(window_size.y),
-				-evt.motion.yrel / float(window_size.y)
-			);
-			camera->transform->rotation = glm::normalize(
-				camera->transform->rotation
-				* glm::angleAxis(-motion.x * camera->fovy, glm::vec3(0.0f, 1.0f, 0.0f))
-				* glm::angleAxis(motion.y * camera->fovy, glm::vec3(1.0f, 0.0f, 0.0f))
-			);
+		} else if (evt.key.key == SDLK_R) {
+			restart_button.downs += 1;
 			return true;
 		}
 	}
@@ -137,50 +156,34 @@ bool PlayMode::handle_event(SDL_Event const &evt, glm::uvec2 const &window_size)
 }
 
 void PlayMode::update(float elapsed) {
+	//every action below is a single discrete step, not a continuous motion,
+	// so 'elapsed' isn't needed here:
 
-	//slowly rotates through [0,1):
-	wobble += elapsed / 10.0f;
-	wobble -= std::floor(wobble);
-
-	hip->rotation = hip_base_rotation * glm::angleAxis(
-		glm::radians(5.0f * std::sin(wobble * 2.0f * float(M_PI))),
-		glm::vec3(0.0f, 1.0f, 0.0f)
-	);
-	upper_leg->rotation = upper_leg_base_rotation * glm::angleAxis(
-		glm::radians(7.0f * std::sin(wobble * 2.0f * 2.0f * float(M_PI))),
-		glm::vec3(0.0f, 0.0f, 1.0f)
-	);
-	lower_leg->rotation = lower_leg_base_rotation * glm::angleAxis(
-		glm::radians(10.0f * std::sin(wobble * 3.0f * 2.0f * float(M_PI))),
-		glm::vec3(0.0f, 0.0f, 1.0f)
-	);
-
-	//move sound to follow leg tip position:
-	leg_tip_loop->set_position(get_leg_tip_position(), 1.0f / 60.0f);
-
-	//move camera:
-	{
-
-		//combine inputs into a move:
-		constexpr float PlayerSpeed = 30.0f;
-		glm::vec2 move = glm::vec2(0.0f);
-		if (left.pressed && !right.pressed) move.x =-1.0f;
-		if (!left.pressed && right.pressed) move.x = 1.0f;
-		if (down.pressed && !up.pressed) move.y =-1.0f;
-		if (!down.pressed && up.pressed) move.y = 1.0f;
-
-		//make it so that moving diagonally doesn't go faster:
-		if (move != glm::vec2(0.0f)) move = glm::normalize(move) * PlayerSpeed * elapsed;
-
-		glm::mat4x3 frame = camera->transform->make_parent_from_local();
-		glm::vec3 frame_right = frame[0];
-		//glm::vec3 up = frame[1];
-		glm::vec3 frame_forward = -frame[2];
-
-		camera->transform->position += move.x * frame_right + move.y * frame_forward;
+	if (restart_button.downs > 0) {
+		player_cell = start_cell;
+		facing = 1;
+		won = false;
 	}
 
-	{ //update listener to camera position:
+	if (!won) {
+		if (turn_left.downs > 0) {
+			facing = (facing + 3) % 4; //rotate 90 degrees counter-clockwise
+			Sound::play(*turn_sample, 0.5f);
+		}
+		if (turn_right.downs > 0) {
+			facing = (facing + 1) % 4; //rotate 90 degrees clockwise
+			Sound::play(*turn_sample, 0.5f);
+		}
+
+		if (move_forward.downs > 0) try_step(FacingDelta[facing]);
+		if (move_back.downs > 0) try_step(-FacingDelta[facing]);
+
+		if (player_cell == exit_cell) won = true;
+	}
+
+	update_camera_transform();
+
+	{ //update listener to camera position/orientation:
 		glm::mat4x3 frame = camera->transform->make_parent_from_local();
 		glm::vec3 frame_right = frame[0];
 		glm::vec3 frame_at = frame[3];
@@ -188,58 +191,53 @@ void PlayMode::update(float elapsed) {
 	}
 
 	//reset button press counters:
-	left.downs = 0;
-	right.downs = 0;
-	up.downs = 0;
-	down.downs = 0;
+	turn_left.downs = 0;
+	turn_right.downs = 0;
+	move_forward.downs = 0;
+	move_back.downs = 0;
+	restart_button.downs = 0;
 }
 
 void PlayMode::draw(glm::uvec2 const &drawable_size) {
-	//update camera aspect ratio for drawable:
 	camera->aspect = float(drawable_size.x) / float(drawable_size.y);
 
-	//set up light type and position for lit_color_texture_program:
-	// TODO: consider using the Light(s) in the scene to do this
-	glUseProgram(lit_color_texture_program->program);
-	glUniform1i(lit_color_texture_program->LIGHT_TYPE_int, 1);
-	glUniform3fv(lit_color_texture_program->LIGHT_DIRECTION_vec3, 1, glm::value_ptr(glm::vec3(0.0f, 0.0f,-1.0f)));
-	glUniform3fv(lit_color_texture_program->LIGHT_ENERGY_vec3, 1, glm::value_ptr(glm::vec3(1.0f, 1.0f, 0.95f)));
-	glUseProgram(0);
-
-	glClearColor(0.5f, 0.5f, 0.5f, 1.0f);
-	glClearDepth(1.0f); //1.0 is actually the default value to clear the depth buffer to, but FYI you can change it.
+	//pure black -- this is a blackout maze, there is nothing to see:
+	glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+	glClearDepth(1.0f);
 	glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
-	glEnable(GL_DEPTH_TEST);
-	glDepthFunc(GL_LESS); //this is the default depth comparison function, but FYI you can change it.
+	scene.draw(*camera); //no drawables yet, so this is a no-op
 
-	scene.draw(*camera);
-
-	{ //use DrawLines to overlay some text:
+	{ //use PixelText to overlay some text (pixel-font.png, reused from game2/game1's own asset pipeline):
 		glDisable(GL_DEPTH_TEST);
 		float aspect = float(drawable_size.x) / float(drawable_size.y);
-		DrawLines lines(glm::mat4(
+		glm::mat4 clip_from_local(
 			1.0f / aspect, 0.0f, 0.0f, 0.0f,
 			0.0f, 1.0f, 0.0f, 0.0f,
 			0.0f, 0.0f, 1.0f, 0.0f,
 			0.0f, 0.0f, 0.0f, 1.0f
-		));
+		);
 
+		//NOTE: pixel-font.png only has uppercase letters, digits, and " /-!:." --
+		// keep HUD strings within that character set:
 		constexpr float H = 0.09f;
-		lines.draw_text("Mouse motion rotates camera; WASD moves; escape ungrabs mouse",
-			glm::vec3(-aspect + 0.1f * H, -1.0 + 0.1f * H, 0.0),
-			glm::vec3(H, 0.0f, 0.0f), glm::vec3(0.0f, H, 0.0f),
-			glm::u8vec4(0x00, 0x00, 0x00, 0x00));
-		float ofs = 2.0f / drawable_size.y;
-		lines.draw_text("Mouse motion rotates camera; WASD moves; escape ungrabs mouse",
-			glm::vec3(-aspect + 0.1f * H + ofs, -1.0 + + 0.1f * H + ofs, 0.0),
-			glm::vec3(H, 0.0f, 0.0f), glm::vec3(0.0f, H, 0.0f),
-			glm::u8vec4(0xff, 0xff, 0xff, 0x00));
+		{
+			PixelText text(clip_from_local);
+			text.draw("A/D TURN. W/S MOVE. R RESTART.",
+				glm::vec3(-aspect + 0.1f * H, -1.0f + 1.1f * H, 0.0f), H);
+		}
+
+		{ //current facing, as 1/2/3/4 (north/east/south/west):
+			PixelText text(clip_from_local);
+			text.draw("DIRECTION: " + std::to_string(facing + 1),
+				glm::vec3(-aspect + 0.1f * H, 1.0f - 1.1f * H, 0.0f), H);
+		}
+
+		if (won) {
+			PixelText text(clip_from_local);
+			text.draw("YOU FOUND THE EXIT! PRESS R TO RESTART.",
+				glm::vec3(-aspect + 0.1f * H, 1.0f - 2.4f * H, 0.0f), H);
+		}
 	}
 	GL_ERRORS();
-}
-
-glm::vec3 PlayMode::get_leg_tip_position() {
-	//the vertex position here was read from the model in blender:
-	return lower_leg->make_world_from_local() * glm::vec4(-1.26137f, -11.861f, 0.0f, 1.0f);
 }
